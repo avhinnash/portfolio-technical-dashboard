@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from scipy.optimize import minimize
+from scipy.stats import norm
 
 st.set_page_config(page_title="Portfolio Dashboard", page_icon="📈", layout="wide")
 
@@ -28,7 +29,8 @@ PORTFOLIO: Dict[str, float] = {
 }
 
 HEDGE = "SOXX PUT"
-OPTIMIZER_ASSETS = list(PORTFOLIO.keys()) + [HEDGE]
+MSTR_CC = "MSTR CC"
+OPTIMIZER_ASSETS = list(PORTFOLIO.keys()) + [MSTR_CC, HEDGE]
 
 DISPLAY_NAMES: Dict[str, str] = {
     "IXG": "Global Financials",
@@ -42,10 +44,12 @@ DISPLAY_NAMES: Dict[str, str] = {
     "EWZ": "Brazil",
     "STRK": "Strategy Preferred",
     "STRF": "Strategy Perpetual Preferred",
+    "MSTR": "Strategy common stock",
     "SPY": "S&P 500",
     "QQQ": "Nasdaq-100",
     "SOXX": "Semiconductors",
     HEDGE: "Long SOXX Put Hedge",
+    MSTR_CC: "200-share MSTR covered-call sleeve",
 }
 
 DEFAULT_CUSTOM_RETURNS: Dict[str, float] = {
@@ -60,7 +64,8 @@ DEFAULT_CUSTOM_RETURNS: Dict[str, float] = {
     "EWZ": 0.080,
     "STRK": 0.085,
     "STRF": 0.085,
-    HEDGE: -0.200,
+    MSTR_CC: 0.12,
+    HEDGE: -0.20,
 }
 
 MA_WINDOWS = [20, 50, 100, 200]
@@ -70,34 +75,24 @@ EMA_WINDOWS = [8, 21]
 @st.cache_data(ttl=900, show_spinner=False)
 def download_history(tickers: Tuple[str, ...], start: dt.date, end: dt.date) -> Dict[str, pd.DataFrame]:
     raw = yf.download(
-        list(tickers),
-        start=start,
-        end=end,
-        interval="1d",
-        auto_adjust=False,
-        actions=False,
-        group_by="ticker",
-        threads=True,
-        progress=False,
+        list(tickers), start=start, end=end, interval="1d", auto_adjust=False,
+        actions=False, group_by="ticker", threads=True, progress=False,
     )
     out: Dict[str, pd.DataFrame] = {}
     if raw.empty:
         return out
-
     for ticker in tickers:
         try:
             if isinstance(raw.columns, pd.MultiIndex):
-                level0 = raw.columns.get_level_values(0)
-                level1 = raw.columns.get_level_values(1)
-                if ticker in level0:
+                l0, l1 = raw.columns.get_level_values(0), raw.columns.get_level_values(1)
+                if ticker in l0:
                     df = raw[ticker].copy()
-                elif ticker in level1:
+                elif ticker in l1:
                     df = raw.xs(ticker, axis=1, level=1).copy()
                 else:
                     continue
             else:
                 df = raw.copy()
-
             if "Adj Close" not in df.columns and "Close" in df.columns:
                 df["Adj Close"] = df["Close"]
             required = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -128,38 +123,21 @@ def add_indicators(df: pd.DataFrame, display_start: dt.date) -> pd.DataFrame:
 
 def technical_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name=ticker,
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-            increasing_fillcolor="#26a69a",
-            decreasing_fillcolor="#ef5350",
-        )
-    )
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name=ticker,
+        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+    ))
     styles = {
-        "DMA 20": ("#fbc02d", 1.3),
-        "DMA 50": ("#42a5f5", 1.4),
-        "DMA 100": ("#7e57c2", 1.4),
-        "DMA 200": ("#ef6c00", 1.8),
-        "EMA 8": ("#66bb6a", 1.0),
-        "EMA 21": ("#ec407a", 1.0),
-        "1Y AVWAP": ("#ffffff", 2.0),
+        "DMA 20": ("#fbc02d", 1.3), "DMA 50": ("#42a5f5", 1.4),
+        "DMA 100": ("#7e57c2", 1.4), "DMA 200": ("#ef6c00", 1.8),
+        "EMA 8": ("#66bb6a", 1.0), "EMA 21": ("#ec407a", 1.0), "1Y AVWAP": ("#ffffff", 2.0),
     }
     for col, (color, width) in styles.items():
         fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col, line=dict(color=color, width=width)))
     fig.update_layout(
-        title=f"{ticker} · {DISPLAY_NAMES.get(ticker, ticker)}",
-        template="plotly_dark",
-        height=680,
-        margin=dict(l=10, r=10, t=55, b=10),
-        hovermode="x unified",
-        xaxis_rangeslider_visible=False,
+        title=f"{ticker} · {DISPLAY_NAMES.get(ticker, ticker)}", template="plotly_dark", height=680,
+        margin=dict(l=10, r=10, t=55, b=10), hovermode="x unified", xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1, font=dict(size=11)),
         yaxis=dict(title="Price (USD)", side="right"),
     )
@@ -180,10 +158,7 @@ def beta_to(returns: pd.DataFrame, benchmark: str) -> pd.Series:
     b = returns[benchmark]
     for c in returns.columns:
         pair = pd.concat([returns[c], b], axis=1).dropna()
-        if len(pair) < 30 or pair.iloc[:, 1].var() == 0:
-            out[c] = np.nan
-        else:
-            out[c] = pair.iloc[:, 0].cov(pair.iloc[:, 1]) / pair.iloc[:, 1].var()
+        out[c] = np.nan if len(pair) < 30 or pair.iloc[:, 1].var() == 0 else pair.iloc[:, 0].cov(pair.iloc[:, 1]) / pair.iloc[:, 1].var()
     return pd.Series(out)
 
 
@@ -198,8 +173,7 @@ def portfolio_stats(returns: pd.DataFrame, weights: pd.Series):
     variance = float(w.values @ cov_ann.values @ w.values)
     vol = np.sqrt(max(variance, 0))
     marginal = cov_ann.values @ w.values
-    contrib = w.values * marginal
-    pct_contrib = contrib / variance if variance > 0 else np.repeat(np.nan, len(cols))
+    pct_contrib = (w.values * marginal / variance) if variance > 0 else np.repeat(np.nan, len(cols))
     return vol, pd.Series(pct_contrib, index=cols), cov_ann, len(clean)
 
 
@@ -213,22 +187,38 @@ def stress_corr(returns: pd.DataFrame, benchmark: str, q: float):
 
 def heatmap(matrix: pd.DataFrame, title: str) -> go.Figure:
     fig = px.imshow(matrix, text_auto=".2f", aspect="auto", zmin=-1, zmax=1, color_continuous_scale="RdBu_r")
-    fig.update_layout(
-        title=title,
-        template="plotly_dark",
-        height=max(520, 48 * len(matrix.columns)),
-        margin=dict(l=10, r=10, t=60, b=10),
-        coloraxis_colorbar=dict(title="ρ"),
-    )
+    fig.update_layout(title=title, template="plotly_dark", height=max(520, 48 * len(matrix.columns)), margin=dict(l=10, r=10, t=60, b=10), coloraxis_colorbar=dict(title="ρ"))
     return fig
 
 
 def synthetic_soxx_put_returns(soxx_returns: pd.Series, downside_beta: float, annual_carry: float, convexity: float) -> pd.Series:
-    """Simplified daily proxy for a rolling long-put sleeve."""
     r = soxx_returns.fillna(0.0)
     downside = np.minimum(r, 0.0)
     proxy = -downside_beta * r + convexity * downside.pow(2) - annual_carry / 252.0
     return proxy.rename(HEDGE)
+
+
+def covered_call_terms(delta: float, dte: int, iv: float, rf: float) -> tuple[float, float, float]:
+    """Return strike/spot, premium/spot, and annualized gross premium yield from a Black-Scholes approximation."""
+    T = max(dte, 1) / 365.0
+    sigma = max(iv, 1e-6)
+    d1 = norm.ppf(np.clip(delta, 0.01, 0.99))
+    strike_ratio = np.exp((rf + 0.5 * sigma**2) * T - d1 * sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    premium_ratio = norm.cdf(d1) - strike_ratio * np.exp(-rf * T) * norm.cdf(d2)
+    annualized_premium = premium_ratio * 365.0 / max(dte, 1)
+    return float(strike_ratio), float(max(premium_ratio, 0.0)), float(max(annualized_premium, 0.0))
+
+
+def synthetic_mstr_cc_returns(mstr_returns: pd.Series, call_delta: float, dte: int, iv: float, rf: float, income_capture: float) -> tuple[pd.Series, float, float]:
+    """Simplified rolling covered-call proxy: full downside, reduced upside, plus modeled option premium carry."""
+    _, premium_ratio, annualized_premium = covered_call_terms(call_delta, dte, iv, rf)
+    r = mstr_returns.fillna(0.0)
+    downside = np.minimum(r, 0.0)
+    upside = np.maximum(r, 0.0)
+    daily_income = annualized_premium * np.clip(income_capture, 0.0, 1.0) / 252.0
+    proxy = downside + (1.0 - call_delta) * upside + daily_income
+    return proxy.rename(MSTR_CC), premium_ratio, annualized_premium
 
 
 def geometric_annual_return(r: pd.Series) -> float:
@@ -279,14 +269,10 @@ def optimize_weights(objective: str, mu: np.ndarray, cov: np.ndarray, rf: float,
 
 
 def efficient_frontier(mu: np.ndarray, cov: np.ndarray, bounds: list[tuple[float, float]], x0: np.ndarray) -> pd.DataFrame:
-    low = max(float(np.min(mu)), 0.0)
-    high = float(np.max(mu))
+    low, high = max(float(np.min(mu)), 0.0), float(np.max(mu))
     rows = []
     for target in np.linspace(low, high, 30):
-        constraints = [
-            {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
-            {"type": "ineq", "fun": lambda w, t=target: float(w @ mu) - t},
-        ]
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}, {"type": "ineq", "fun": lambda w, t=target: float(w @ mu) - t}]
         res = minimize(lambda w: float(w @ cov @ w), x0=x0, method="SLSQP", bounds=bounds, constraints=constraints)
         if res.success:
             ret, vol, _ = port_metrics(res.x, mu, cov, 0.0)
@@ -306,14 +292,14 @@ def monte_carlo_portfolio(mu: float, vol: float, horizons: list[int], n_sims: in
 
 
 st.title("Portfolio Technical, Risk & Optimization Dashboard")
-st.caption("Live historical data via Yahoo Finance. Includes technical indicators, covariance, volatility, beta, risk contribution, downside-regime analysis, Monte Carlo ranges, and portfolio optimization.")
+st.caption("Live historical data via Yahoo Finance. Includes technical indicators, covariance, volatility, beta, risk contribution, downside-regime analysis, Monte Carlo ranges, covered-call income modeling, and portfolio optimization.")
 
 tab1, tab2, tab3 = st.tabs(["📈 Technical Charts", "🧭 Portfolio Risk", "⚙️ Portfolio Optimizer"])
 today = dt.date.today()
 end_date = today + dt.timedelta(days=1)
 
 with tab1:
-    ticker = st.selectbox("Ticker", list(PORTFOLIO.keys()), index=0)
+    ticker = st.selectbox("Ticker", list(PORTFOLIO.keys()) + ["MSTR"], index=0)
     display_start = today - dt.timedelta(days=365)
     start_date = display_start - dt.timedelta(days=330)
     with st.spinner("Loading market data..."):
@@ -345,8 +331,7 @@ with tab2:
     with c2:
         stress_pct = st.selectbox("Stress sample", [10, 20, 25], index=1, format_func=lambda x: f"Worst {x}% of SPY days")
     with c3:
-        selected = st.multiselect("Holdings", options=list(PORTFOLIO.keys()), default=list(PORTFOLIO.keys()))
-
+        selected = st.multiselect("Holdings", options=list(PORTFOLIO.keys()) + ["MSTR"], default=list(PORTFOLIO.keys()))
     if selected:
         years = {"1Y": 1, "3Y": 3, "5Y": 5}[lookback]
         start = today - dt.timedelta(days=int(365.25 * years) + 30)
@@ -358,22 +343,22 @@ with tab2:
         missing = [c for c in selected if c not in prices.columns]
         if missing:
             st.warning("No usable data returned for: " + ", ".join(missing))
-        if not available:
-            st.error("No usable holdings data returned.")
-        else:
+        if available:
             returns = prices.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
             corr = returns[available].corr(min_periods=30)
             vols = annualized_vol(returns[available])
             beta_spy = beta_to(returns[available + ["SPY"]].dropna(how="all"), "SPY").reindex(available)
             beta_qqq = beta_to(returns[available + ["QQQ"]].dropna(how="all"), "QQQ").reindex(available)
             weights = pd.Series(PORTFOLIO).reindex(available).dropna()
-            pvol, rc, cov_ann, common_obs = portfolio_stats(returns, weights)
+            if not weights.empty:
+                pvol, rc, cov_ann, common_obs = portfolio_stats(returns, weights)
+            else:
+                pvol, rc, cov_ann, common_obs = np.nan, pd.Series(dtype=float), pd.DataFrame(), 0
             top1, top2, top3, top4 = st.columns(4)
-            top1.metric("Portfolio annualized vol", f"{pvol:.1%}" if pd.notna(pvol) else "—")
+            top1.metric("Core portfolio annualized vol", f"{pvol:.1%}" if pd.notna(pvol) else "—")
             top2.metric("Common observations", f"{common_obs:,}")
-            top3.metric("Selected target weight", f"{weights.sum():.0%}")
+            top3.metric("Selected core target weight", f"{weights.sum():.0%}" if not weights.empty else "—")
             top4.metric("Lookback", lookback)
-
             summary = pd.DataFrame(index=available)
             summary["Target weight"] = pd.Series(PORTFOLIO).reindex(available)
             summary["Annualized vol"] = vols.reindex(available)
@@ -383,32 +368,14 @@ with tab2:
             summary["Available obs"] = [int(returns[c].notna().sum()) for c in available]
             st.markdown("### Risk snapshot")
             st.dataframe(summary.style.format({"Target weight": "{:.0%}", "Annualized vol": "{:.1%}", "Beta vs SPY": "{:.2f}", "Beta vs QQQ": "{:.2f}", "Risk contribution": "{:.1%}", "Available obs": "{:,.0f}"}, na_rep="—"), use_container_width=True)
-
             st.markdown("### Correlation matrix")
             st.plotly_chart(heatmap(corr, f"{lookback} pairwise daily-return correlation"), use_container_width=True)
-
-            if not rc.empty:
-                rc_df = rc.sort_values().rename("Risk contribution").reset_index()
-                rc_df.columns = ["Ticker", "Risk contribution"]
-                fig_rc = px.bar(rc_df, x="Risk contribution", y="Ticker", orientation="h", text="Risk contribution", title="Contribution to portfolio variance")
-                fig_rc.update_traces(texttemplate="%{text:.1%}", textposition="outside")
-                fig_rc.update_xaxes(tickformat=".0%")
-                fig_rc.update_layout(template="plotly_dark", height=450)
-                st.plotly_chart(fig_rc, use_container_width=True)
-
             if "SPY" in returns.columns:
-                stress_input_cols = available + ["SPY"]
-                stress_matrix, stress_obs, threshold = stress_corr(returns[stress_input_cols], benchmark="SPY", q=stress_pct / 100.0)
+                stress_matrix, stress_obs, threshold = stress_corr(returns[available + ["SPY"]], benchmark="SPY", q=stress_pct / 100.0)
                 st.markdown(f"### Stress correlation · worst {stress_pct}% of SPY days")
                 st.plotly_chart(heatmap(stress_matrix.loc[available, available], f"Stress correlation on SPY days ≤ {threshold:.2%} ({stress_obs} sessions)"), use_container_width=True)
-
-            with st.expander("Annualized covariance matrix"):
-                if cov_ann.empty:
-                    st.info("Not enough overlapping observations.")
-                else:
-                    st.dataframe(cov_ann.style.format("{:.4f}"), use_container_width=True)
-
-            st.caption("Methodology: daily adjusted-close percentage returns; annualized volatility uses √252; portfolio volatility uses wᵀΣw; risk contribution uses each holding's component contribution to total portfolio variance. STRK and STRF have shorter histories, which shortens common-history calculations.")
+        else:
+            st.error("No usable holdings data returned.")
 
 with tab3:
     st.markdown("### Portfolio construction assumptions")
@@ -421,6 +388,29 @@ with tab3:
         rf = st.number_input("Risk-free rate", min_value=0.0, max_value=0.20, value=0.04, step=0.005, format="%.3f")
     with o4:
         market_return = st.number_input("Market expected return", min_value=-0.10, max_value=0.30, value=0.085, step=0.005, format="%.3f")
+
+    st.markdown("#### MSTR covered-call sleeve")
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    with cc1:
+        mstr_shares = st.number_input("MSTR shares", min_value=0, max_value=10000, value=200, step=100)
+    with cc2:
+        call_style = st.selectbox("Call target", ["35 delta", "ATM (~50 delta)"], index=0)
+    with cc3:
+        call_dte = st.number_input("Call DTE", min_value=7, max_value=180, value=47, step=1)
+    with cc4:
+        mstr_iv = st.number_input("Assumed MSTR IV", min_value=0.10, max_value=3.00, value=0.80, step=0.05, format="%.2f")
+    cc5, cc6, cc7, cc8 = st.columns(4)
+    with cc5:
+        income_capture = st.number_input("Premium income capture", min_value=0.0, max_value=1.0, value=0.70, step=0.05, format="%.2f", help="Haircut to theoretical premium to reflect rolls, slippage, buybacks, and imperfect execution.")
+    with cc6:
+        total_portfolio_value = st.number_input("Total portfolio value ($)", min_value=1.0, value=250000.0, step=10000.0, format="%.0f", help="Used only to translate the fixed 200-share MSTR position into a current portfolio weight.")
+    with cc7:
+        max_mstr_cc_weight = st.number_input("Max MSTR CC weight", min_value=0.0, max_value=1.0, value=0.40, step=0.01, format="%.2f")
+    with cc8:
+        lock_mstr_weight = st.checkbox("Lock current MSTR weight", value=False, help="When checked, the optimizer keeps the MSTR covered-call sleeve at its current share-derived weight.")
+
+    call_delta = 0.35 if call_style.startswith("35") else 0.50
+    contracts = int(mstr_shares // 100)
 
     st.markdown("#### SOXX long-put proxy")
     h1, h2, h3, h4 = st.columns(4)
@@ -435,16 +425,33 @@ with tab3:
 
     years = {"1Y": 1, "3Y": 3, "5Y": 5}[opt_lookback]
     start = today - dt.timedelta(days=int(365.25 * years) + 30)
-    needed = tuple(dict.fromkeys(list(PORTFOLIO.keys()) + ["SPY", "SOXX"]))
+    needed = tuple(dict.fromkeys(list(PORTFOLIO.keys()) + ["SPY", "SOXX", "MSTR"]))
     with st.spinner("Loading optimizer history..."):
         opt_raw = download_history(needed, start, end_date)
     opt_prices = adjusted_close(opt_raw)
 
-    if "SOXX" not in opt_prices.columns:
-        st.error("SOXX history is required to build the put-hedge proxy.")
+    if "SOXX" not in opt_prices.columns or "MSTR" not in opt_prices.columns:
+        st.error("SOXX and MSTR history are required to build the option-strategy proxies.")
     else:
         base_returns = opt_prices.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
         base_returns[HEDGE] = synthetic_soxx_put_returns(base_returns["SOXX"], put_downside_beta, put_carry, put_convexity)
+        cc_returns, cc_premium_yield, cc_annualized_premium = synthetic_mstr_cc_returns(base_returns["MSTR"], call_delta, int(call_dte), float(mstr_iv), rf, income_capture)
+        base_returns[MSTR_CC] = cc_returns
+
+        latest_mstr = float(opt_prices["MSTR"].dropna().iloc[-1])
+        mstr_market_value = float(mstr_shares) * latest_mstr
+        current_mstr_weight = min(mstr_market_value / float(total_portfolio_value), 1.0) if total_portfolio_value > 0 else 0.0
+        strike_ratio, _, _ = covered_call_terms(call_delta, int(call_dte), float(mstr_iv), rf)
+        implied_strike = latest_mstr * strike_ratio
+
+        p1, p2, p3, p4, p5 = st.columns(5)
+        p1.metric("MSTR price", f"${latest_mstr:,.2f}")
+        p2.metric("200-share market value" if mstr_shares == 200 else "Share market value", f"${mstr_market_value:,.0f}")
+        p3.metric("Covered calls", f"{contracts} contracts")
+        p4.metric("Modeled strike", f"${implied_strike:,.0f}")
+        p5.metric("Gross premium / cycle", f"{cc_premium_yield:.1%}")
+        st.caption(f"At {call_style}, {int(call_dte)} DTE and {mstr_iv:.0%} assumed IV, the Black-Scholes proxy implies about {cc_premium_yield:.1%} gross premium per cycle before the {income_capture:.0%} income-capture haircut. Current MSTR sleeve weight is {current_mstr_weight:.1%} using the portfolio value entered above.")
+
         available_assets = [a for a in OPTIMIZER_ASSETS if a in base_returns.columns]
         missing_assets = [a for a in OPTIMIZER_ASSETS if a not in available_assets]
         if missing_assets:
@@ -454,21 +461,24 @@ with tab3:
             st.error("Not enough asset history to run the optimizer.")
         else:
             st.markdown("#### Editable portfolio")
-            initial_weights = {**PORTFOLIO, HEDGE: 0.0}
-            editor = pd.DataFrame({"Asset": available_assets, "Weight %": [initial_weights.get(a, 0.0) * 100 for a in available_assets], "Expected return %": [DEFAULT_CUSTOM_RETURNS.get(a, 0.07) * 100 for a in available_assets], "Max weight %": [max_put_weight * 100 if a == HEDGE else 35.0 for a in available_assets]})
+            core_scale = max(1.0 - current_mstr_weight, 0.0)
+            initial_weights = {a: w * core_scale for a, w in PORTFOLIO.items()}
+            initial_weights[MSTR_CC] = current_mstr_weight
+            initial_weights[HEDGE] = 0.0
+            editor = pd.DataFrame({
+                "Asset": available_assets,
+                "Weight %": [initial_weights.get(a, 0.0) * 100 for a in available_assets],
+                "Expected return %": [DEFAULT_CUSTOM_RETURNS.get(a, 0.07) * 100 for a in available_assets],
+                "Max weight %": [max_put_weight * 100 if a == HEDGE else max_mstr_cc_weight * 100 if a == MSTR_CC else 35.0 for a in available_assets],
+            })
             edited = st.data_editor(
-                editor,
-                hide_index=True,
-                use_container_width=True,
-                disabled=["Asset"],
+                editor, hide_index=True, use_container_width=True, disabled=["Asset"],
                 column_config={
                     "Weight %": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=1.0),
                     "Expected return %": st.column_config.NumberColumn(min_value=-100.0, max_value=100.0, step=0.5),
                     "Max weight %": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=1.0),
-                },
-                key="optimizer_editor",
+                }, key="optimizer_editor",
             )
-
             w_user = pd.Series(edited["Weight %"].to_numpy() / 100.0, index=edited["Asset"])
             custom_mu = pd.Series(edited["Expected return %"].to_numpy() / 100.0, index=edited["Asset"])
             max_w = pd.Series(edited["Max weight %"].to_numpy() / 100.0, index=edited["Asset"])
@@ -478,7 +488,6 @@ with tab3:
             else:
                 w_current = w_user / w_user.sum()
                 st.caption(f"Entered weights sum to {w_user.sum():.1%}; calculations normalize them to 100%.")
-
                 common = base_returns[available_assets].dropna()
                 if len(common) < 30:
                     st.error("Not enough overlapping observations for covariance estimation. STRK/STRF short histories may be the limiting factor.")
@@ -488,7 +497,13 @@ with tab3:
                     mu = mu_series.values.astype(float)
                     cov = cov_ann.loc[available_assets, available_assets].values.astype(float)
                     w0 = w_current.reindex(available_assets).fillna(0.0).values
-                    bounds = [(0.0, float(max_w.get(a, 0.35))) for a in available_assets]
+                    bounds = []
+                    for a in available_assets:
+                        if a == MSTR_CC and lock_mstr_weight:
+                            fixed = float(w_current.get(MSTR_CC, current_mstr_weight))
+                            bounds.append((fixed, fixed))
+                        else:
+                            bounds.append((0.0, float(max_w.get(a, 0.35))))
 
                     current_ret, current_vol, current_sharpe = port_metrics(w0, mu, cov, rf)
                     p_marginal = cov @ w0
@@ -511,7 +526,6 @@ with tab3:
                     st.markdown("### Probabilistic return range")
                     sims = monte_carlo_portfolio(current_ret, current_vol, [1, 3, 5, 10], n_sims=10000)
                     st.dataframe(sims.style.format("{:.1%}"), use_container_width=True)
-                    st.caption("Monte Carlo ranges use a constant expected return and volatility with lognormal compounding. They are scenario ranges, not forecasts or guarantees.")
 
                     st.markdown("### Optimize weights")
                     q1, q2, q3 = st.columns(3)
@@ -531,12 +545,10 @@ with tab3:
                         compare = pd.DataFrame({"Asset": available_assets, "Current": w0, "Optimized": w_opt})
                         compare["Change"] = compare["Optimized"] - compare["Current"]
                         st.dataframe(compare.style.format({"Current": "{:.1%}", "Optimized": "{:.1%}", "Change": "{:+.1%}"}), use_container_width=True)
-
                         z1, z2, z3 = st.columns(3)
                         z1.metric("Optimized return", f"{opt_ret:.1%}", f"{opt_ret - current_ret:+.1%}")
                         z2.metric("Optimized volatility", f"{opt_vol:.1%}", f"{opt_vol - current_vol:+.1%}")
                         z3.metric("Optimized Sharpe", f"{opt_sharpe:.2f}" if np.isfinite(opt_sharpe) else "—", f"{opt_sharpe - current_sharpe:+.2f}" if np.isfinite(opt_sharpe) and np.isfinite(current_sharpe) else None)
-
                         frontier = efficient_frontier(mu, cov, bounds, w0)
                         if not frontier.empty:
                             fig_frontier = px.line(frontier, x="Volatility", y="Return", title="Efficient frontier")
@@ -546,7 +558,6 @@ with tab3:
                             fig_frontier.update_yaxes(tickformat=".0%")
                             fig_frontier.update_layout(template="plotly_dark", height=520)
                             st.plotly_chart(fig_frontier, use_container_width=True)
-
                         st.markdown("#### Optimized probabilistic range")
                         opt_sims = monte_carlo_portfolio(opt_ret, opt_vol, [1, 3, 5, 10], n_sims=10000)
                         st.dataframe(opt_sims.style.format("{:.1%}"), use_container_width=True)
@@ -554,4 +565,4 @@ with tab3:
                     with st.expander("Optimizer covariance matrix"):
                         st.dataframe(cov_ann.loc[available_assets, available_assets].style.format("{:.4f}"), use_container_width=True)
 
-                    st.info("SOXX PUT is a simplified rolling-hedge proxy, not a live option valuation. Its return stream is driven by user-set downside sensitivity, annual carry drag, and convexity. Actual put returns depend on strike, tenor, implied volatility, skew, path, and roll timing.")
+                    st.info("MSTR CC and SOXX PUT are strategy proxies, not live option valuations. The MSTR sleeve models full downside, reduced upside based on short-call delta, and Black-Scholes premium carry with an execution haircut. Actual results depend on implied volatility, skew, strike selection, path, assignment, taxes, slippage, and roll timing.")
