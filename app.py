@@ -49,26 +49,55 @@ DISPLAY_NAMES: Dict[str, str] = {
 MA_WINDOWS = [20, 50, 100, 200]
 EMA_WINDOWS = [8, 21]
 
+
 @st.cache_data(ttl=900, show_spinner=False)
 def download_history(tickers: Tuple[str, ...], start: dt.date, end: dt.date) -> Dict[str, pd.DataFrame]:
     raw = yf.download(
-        list(tickers), start=start, end=end, interval="1d", auto_adjust=False,
-        actions=False, group_by="ticker", threads=True, progress=False,
+        list(tickers),
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=False,
+        actions=False,
+        group_by="ticker",
+        threads=True,
+        progress=False,
     )
+
     out: Dict[str, pd.DataFrame] = {}
+    if raw.empty:
+        return out
+
     for ticker in tickers:
         try:
-            df = raw.copy() if len(tickers) == 1 else raw[ticker].copy()
+            # Recent yfinance versions may return MultiIndex columns even for
+            # a single ticker, so handle both MultiIndex and flat-column cases.
+            if isinstance(raw.columns, pd.MultiIndex):
+                level0 = raw.columns.get_level_values(0)
+                level1 = raw.columns.get_level_values(1)
+
+                if ticker in level0:
+                    df = raw[ticker].copy()
+                elif ticker in level1:
+                    df = raw.xs(ticker, axis=1, level=1).copy()
+                else:
+                    continue
+            else:
+                df = raw.copy()
+
             if "Adj Close" not in df.columns and "Close" in df.columns:
                 df["Adj Close"] = df["Close"]
+
             required = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
             if not all(c in df.columns for c in required):
                 continue
+
             df = df[required].dropna(subset=["Close"])
             if not df.empty:
                 out[ticker] = df
-        except Exception:
-            continue
+        except Exception as exc:
+            st.warning(f"Could not process {ticker}: {exc}")
+
     return out
 
 
