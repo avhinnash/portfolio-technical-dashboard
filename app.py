@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-
 st.set_page_config(
-    page_title="Portfolio Technical Dashboard",
+    page_title="Portfolio Dashboard",
     page_icon="📈",
     layout="wide",
 )
@@ -33,302 +33,248 @@ PORTFOLIO: Dict[str, float] = {
 DISPLAY_NAMES: Dict[str, str] = {
     "IXG": "Global Financials",
     "IFRA": "U.S. Infrastructure",
-    "IGV": "Expanded Tech-Software",
+    "IGV": "Software",
     "XAR": "Aerospace & Defense",
     "XLP": "Consumer Staples",
     "LLY": "Eli Lilly",
     "INDA": "India",
     "EMXC": "Emerging Markets ex-China",
     "EWZ": "Brazil",
-    "STRK": "Strategy Series A Preferred",
-    "STRF": "Strategy Series A Perpetual Preferred",
+    "STRK": "Strategy Preferred",
+    "STRF": "Strategy Perpetual Preferred",
+    "SPY": "S&P 500",
+    "QQQ": "Nasdaq-100",
 }
 
 MA_WINDOWS = [20, 50, 100, 200]
 EMA_WINDOWS = [8, 21]
 
-
 @st.cache_data(ttl=900, show_spinner=False)
 def download_history(tickers: Tuple[str, ...], start: dt.date, end: dt.date) -> Dict[str, pd.DataFrame]:
-    """Download enough history to calculate the 200 DMA before the one-year display window."""
     raw = yf.download(
-        list(tickers),
-        start=start,
-        end=end,
-        interval="1d",
-        auto_adjust=False,
-        actions=False,
-        group_by="ticker",
-        threads=True,
-        progress=False,
+        list(tickers), start=start, end=end, interval="1d", auto_adjust=False,
+        actions=False, group_by="ticker", threads=True, progress=False,
     )
-
-    output: Dict[str, pd.DataFrame] = {}
+    out: Dict[str, pd.DataFrame] = {}
     for ticker in tickers:
         try:
-            if len(tickers) == 1:
-                df = raw.copy()
-            else:
-                df = raw[ticker].copy()
-
-            required = ["Open", "High", "Low", "Close", "Volume"]
-            if not all(col in df.columns for col in required):
+            df = raw.copy() if len(tickers) == 1 else raw[ticker].copy()
+            if "Adj Close" not in df.columns and "Close" in df.columns:
+                df["Adj Close"] = df["Close"]
+            required = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+            if not all(c in df.columns for c in required):
                 continue
-
-            df = df[required].dropna(subset=["Open", "High", "Low", "Close"])
-            if df.empty:
-                continue
-
-            for window in MA_WINDOWS:
-                df[f"DMA {window}"] = df["Close"].rolling(window).mean()
-
-            for window in EMA_WINDOWS:
-                df[f"EMA {window}"] = df["Close"].ewm(span=window, adjust=False).mean()
-
-            # One-year anchored VWAP: cumulative typical-price x volume divided by cumulative volume
-            typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
-            dollar_volume = typical_price * df["Volume"].fillna(0)
-            cum_volume = df["Volume"].fillna(0).cumsum().replace(0, np.nan)
-            df["1Y AVWAP"] = dollar_volume.cumsum() / cum_volume
-
-            output[ticker] = df
+            df = df[required].dropna(subset=["Close"])
+            if not df.empty:
+                out[ticker] = df
         except Exception:
             continue
+    return out
 
-    return output
+
+def add_indicators(df: pd.DataFrame, display_start: dt.date) -> pd.DataFrame:
+    x = df.copy()
+    for w in MA_WINDOWS:
+        x[f"DMA {w}"] = x["Close"].rolling(w).mean()
+    for w in EMA_WINDOWS:
+        x[f"EMA {w}"] = x["Close"].ewm(span=w, adjust=False).mean()
+    x = x.loc[x.index.date >= display_start].copy()
+    if x.empty:
+        return x
+    typical = (x["High"] + x["Low"] + x["Close"]) / 3.0
+    vol = x["Volume"].fillna(0)
+    x["1Y AVWAP"] = (typical * vol).cumsum() / vol.cumsum().replace(0, np.nan)
+    return x
 
 
-def build_chart(df: pd.DataFrame, ticker: str, show_volume: bool = True) -> go.Figure:
+def technical_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
     fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name=ticker,
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-            increasing_fillcolor="#26a69a",
-            decreasing_fillcolor="#ef5350",
-        )
-    )
-
-    line_styles = {
-        "DMA 20": ("#fbc02d", 1.3),
-        "DMA 50": ("#42a5f5", 1.4),
-        "DMA 100": ("#7e57c2", 1.4),
-        "DMA 200": ("#ef6c00", 1.7),
-        "EMA 8": ("#66bb6a", 1.0),
-        "EMA 21": ("#ec407a", 1.0),
-        "1Y AVWAP": ("#fafafa", 2.0),
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name=ticker, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+    ))
+    styles = {
+        "DMA 20": ("#fbc02d", 1.3), "DMA 50": ("#42a5f5", 1.4),
+        "DMA 100": ("#7e57c2", 1.4), "DMA 200": ("#ef6c00", 1.8),
+        "EMA 8": ("#66bb6a", 1.0), "EMA 21": ("#ec407a", 1.0), "1Y AVWAP": ("#ffffff", 2.0),
     }
-
-    for column, (color, width) in line_styles.items():
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df[column],
-                mode="lines",
-                name=column,
-                line=dict(color=color, width=width),
-                hovertemplate=f"{column}: $%{{y:,.2f}}<extra></extra>",
-            )
-        )
-
+    for col, (color, width) in styles.items():
+        fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col, line=dict(color=color, width=width)))
     fig.update_layout(
-        title=dict(
-            text=f"{ticker} · {DISPLAY_NAMES.get(ticker, ticker)}",
-            x=0.01,
-            xanchor="left",
-        ),
-        template="plotly_dark",
-        height=680 if show_volume else 610,
-        margin=dict(l=10, r=10, t=55, b=10),
-        hovermode="x unified",
-        xaxis_rangeslider_visible=False,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.01,
-            xanchor="right",
-            x=1,
-            font=dict(size=11),
-        ),
+        title=f"{ticker} · {DISPLAY_NAMES.get(ticker, ticker)}", template="plotly_dark", height=680,
+        margin=dict(l=10, r=10, t=55, b=10), hovermode="x unified", xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1, font=dict(size=11)),
         yaxis=dict(title="Price (USD)", side="right"),
     )
-
-    fig.update_xaxes(
-        rangebreaks=[
-            dict(bounds=["sat", "mon"]),
-        ]
-    )
-
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
 
-def technical_snapshot(df: pd.DataFrame) -> Dict[str, object]:
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else last
-    price = float(last["Close"])
-    change = price - float(prev["Close"])
-    change_pct = change / float(prev["Close"]) if float(prev["Close"]) else np.nan
-
-    return {
-        "Price": price,
-        "Daily change": change,
-        "Daily change %": change_pct,
-        "20 DMA": float(last["DMA 20"]) if pd.notna(last["DMA 20"]) else np.nan,
-        "50 DMA": float(last["DMA 50"]) if pd.notna(last["DMA 50"]) else np.nan,
-        "100 DMA": float(last["DMA 100"]) if pd.notna(last["DMA 100"]) else np.nan,
-        "200 DMA": float(last["DMA 200"]) if pd.notna(last["DMA 200"]) else np.nan,
-        "8 EMA": float(last["EMA 8"]) if pd.notna(last["EMA 8"]) else np.nan,
-        "21 EMA": float(last["EMA 21"]) if pd.notna(last["EMA 21"]) else np.nan,
-        "1Y AVWAP": float(last["1Y AVWAP"]) if pd.notna(last["1Y AVWAP"]) else np.nan,
-        "Above 20 DMA": price > float(last["DMA 20"]) if pd.notna(last["DMA 20"]) else False,
-        "Above 50 DMA": price > float(last["DMA 50"]) if pd.notna(last["DMA 50"]) else False,
-        "Above 200 DMA": price > float(last["DMA 200"]) if pd.notna(last["DMA 200"]) else False,
-        "EMA trend": "Bullish" if pd.notna(last["EMA 8"]) and pd.notna(last["EMA 21"]) and last["EMA 8"] > last["EMA 21"] else "Bearish",
-    }
+def adjusted_close(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    return pd.DataFrame({t: df["Adj Close"] for t, df in data.items()}).sort_index()
 
 
-st.title("Portfolio Technical Dashboard")
+def annualized_vol(returns: pd.DataFrame) -> pd.Series:
+    return returns.std(skipna=True) * np.sqrt(252)
+
+
+def beta_to(returns: pd.DataFrame, benchmark: str) -> pd.Series:
+    out = {}
+    b = returns[benchmark]
+    for c in returns.columns:
+        pair = pd.concat([returns[c], b], axis=1).dropna()
+        if len(pair) < 30 or pair.iloc[:, 1].var() == 0:
+            out[c] = np.nan
+        else:
+            out[c] = pair.iloc[:, 0].cov(pair.iloc[:, 1]) / pair.iloc[:, 1].var()
+    return pd.Series(out)
+
+
+def portfolio_stats(returns: pd.DataFrame, weights: pd.Series):
+    cols = [c for c in weights.index if c in returns.columns]
+    clean = returns[cols].dropna()
+    if len(clean) < 20:
+        return np.nan, pd.Series(dtype=float), pd.DataFrame(), len(clean)
+    w = weights.loc[cols].astype(float)
+    w = w / w.sum()
+    cov_ann = clean.cov() * 252
+    variance = float(w.values @ cov_ann.values @ w.values)
+    vol = np.sqrt(max(variance, 0))
+    marginal = cov_ann.values @ w.values
+    contrib = w.values * marginal
+    pct_contrib = contrib / variance if variance > 0 else np.repeat(np.nan, len(cols))
+    return vol, pd.Series(pct_contrib, index=cols), cov_ann, len(clean)
+
+
+def stress_corr(returns: pd.DataFrame, benchmark: str, q: float):
+    b = returns[benchmark].dropna()
+    threshold = b.quantile(q)
+    dates = b[b <= threshold].index
+    stressed = returns.loc[returns.index.intersection(dates)]
+    return stressed.corr(min_periods=10), len(stressed), threshold
+
+
+def heatmap(matrix: pd.DataFrame, title: str) -> go.Figure:
+    fig = px.imshow(matrix, text_auto=".2f", aspect="auto", zmin=-1, zmax=1, color_continuous_scale="RdBu_r")
+    fig.update_layout(
+        title=title, template="plotly_dark", height=max(520, 48 * len(matrix.columns)),
+        margin=dict(l=10, r=10, t=60, b=10), coloraxis_colorbar=dict(title="ρ"),
+    )
+    return fig
+
+
+st.title("Portfolio Technical & Risk Dashboard")
 st.caption(
-    "Daily candles with 20, 50, 100 and 200-day moving averages, 8 and 21-day EMAs, "
-    "and a one-year anchored VWAP. Data refreshes every 15 minutes while the app is running."
+    "Live historical data via Yahoo Finance. Includes technical indicators, correlation, volatility, beta, "
+    "covariance, risk contribution, and downside-regime analysis."
 )
 
-with st.sidebar:
-    st.header("Portfolio")
-    selected = st.multiselect(
-        "Tickers",
-        options=list(PORTFOLIO.keys()),
-        default=list(PORTFOLIO.keys()),
-    )
-    chart_mode = st.radio("View", ["Single chart", "Chart grid"], index=0)
-    selected_ticker = st.selectbox(
-        "Active ticker",
-        options=selected if selected else list(PORTFOLIO.keys()),
-        index=0,
-        disabled=(chart_mode == "Chart grid"),
-    )
-    columns_per_row = st.slider(
-        "Charts per row",
-        min_value=1,
-        max_value=3,
-        value=2,
-        disabled=(chart_mode == "Single chart"),
-    )
-    st.divider()
-    st.markdown("**Indicator definition**")
-    st.caption(
-        "1Y AVWAP is anchored to the first trading session in the displayed one-year window "
-        "and uses typical price: (high + low + close) ÷ 3."
-    )
-
+tab1, tab2 = st.tabs(["📈 Technical Charts", "🧭 Portfolio Risk"])
 today = dt.date.today()
-display_start = today - dt.timedelta(days=365)
-download_start = display_start - dt.timedelta(days=320)
-download_end = today + dt.timedelta(days=1)
+end_date = today + dt.timedelta(days=1)
 
-tickers_to_download = tuple(selected or PORTFOLIO.keys())
-
-with st.spinner("Loading market data..."):
-    histories = download_history(tickers_to_download, download_start, download_end)
-
-# Re-anchor VWAP to the exact one-year display window and trim the chart.
-display_data: Dict[str, pd.DataFrame] = {}
-for ticker, full_df in histories.items():
-    trimmed = full_df.loc[full_df.index.date >= display_start].copy()
-    if trimmed.empty:
-        continue
-    typical_price = (trimmed["High"] + trimmed["Low"] + trimmed["Close"]) / 3.0
-    volume = trimmed["Volume"].fillna(0)
-    trimmed["1Y AVWAP"] = (typical_price * volume).cumsum() / volume.cumsum().replace(0, np.nan)
-    display_data[ticker] = trimmed
-
-missing = [t for t in tickers_to_download if t not in display_data]
-if missing:
-    st.warning(
-        "No usable Yahoo Finance history was returned for: "
-        + ", ".join(missing)
-        + ". Recently issued securities may have less than a full year of history."
-    )
-
-if not display_data:
-    st.error("No market data was returned. Check your internet connection and try again.")
-    st.stop()
-
-# Portfolio snapshot
-rows: List[Dict[str, object]] = []
-for ticker, df in display_data.items():
-    snap = technical_snapshot(df)
-    rows.append(
-        {
-            "Ticker": ticker,
-            "Weight": PORTFOLIO.get(ticker, np.nan),
-            "Price": snap["Price"],
-            "Day": snap["Daily change %"],
-            "vs 20 DMA": snap["Price"] / snap["20 DMA"] - 1 if snap["20 DMA"] else np.nan,
-            "vs 50 DMA": snap["Price"] / snap["50 DMA"] - 1 if snap["50 DMA"] else np.nan,
-            "vs 200 DMA": snap["Price"] / snap["200 DMA"] - 1 if snap["200 DMA"] else np.nan,
-            "vs AVWAP": snap["Price"] / snap["1Y AVWAP"] - 1 if snap["1Y AVWAP"] else np.nan,
-            "EMA trend": snap["EMA trend"],
-        }
-    )
-
-snapshot_df = pd.DataFrame(rows).set_index("Ticker").sort_index()
-
-st.subheader("Portfolio snapshot")
-st.dataframe(
-    snapshot_df.style.format(
-        {
-            "Weight": "{:.0%}",
-            "Price": "${:,.2f}",
-            "Day": "{:+.2%}",
-            "vs 20 DMA": "{:+.2%}",
-            "vs 50 DMA": "{:+.2%}",
-            "vs 200 DMA": "{:+.2%}",
-            "vs AVWAP": "{:+.2%}",
-        },
-        na_rep="—",
-    ),
-    use_container_width=True,
-    height=min(470, 38 + 35 * len(snapshot_df)),
-)
-
-st.divider()
-
-if chart_mode == "Single chart":
-    if selected_ticker not in display_data:
-        st.error(f"No chart data is available for {selected_ticker}.")
+with tab1:
+    ticker = st.selectbox("Ticker", list(PORTFOLIO.keys()), index=0)
+    display_start = today - dt.timedelta(days=365)
+    start_date = display_start - dt.timedelta(days=330)
+    with st.spinner("Loading market data..."):
+        hist = download_history((ticker,), start_date, end_date)
+    if ticker not in hist:
+        st.error(f"No history returned for {ticker}.")
     else:
-        df = display_data[selected_ticker]
-        snap = technical_snapshot(df)
+        df = add_indicators(hist[ticker], display_start)
+        if df.empty:
+            st.error(f"No display-period data available for {ticker}.")
+        else:
+            last = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else last
+            price = float(last["Close"])
+            day_pct = price / float(prev["Close"]) - 1 if float(prev["Close"]) else np.nan
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Last price", f"${price:,.2f}", f"{day_pct:+.2%}")
+            c2.metric("vs 20 DMA", f"{price / last['DMA 20'] - 1:+.2%}" if pd.notna(last["DMA 20"]) else "—")
+            c3.metric("vs 50 DMA", f"{price / last['DMA 50'] - 1:+.2%}" if pd.notna(last["DMA 50"]) else "—")
+            c4.metric("vs 200 DMA", f"{price / last['DMA 200'] - 1:+.2%}" if pd.notna(last["DMA 200"]) else "—")
+            c5.metric("vs 1Y AVWAP", f"{price / last['1Y AVWAP'] - 1:+.2%}" if pd.notna(last["1Y AVWAP"]) else "—")
+            st.plotly_chart(technical_chart(df, ticker), use_container_width=True)
+            st.info("1Y AVWAP is anchored to the first trading session in the displayed one-year window and uses typical price = (High + Low + Close) / 3.")
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Last price", f"${snap['Price']:,.2f}", f"{snap['Daily change %']:+.2%}")
-        c2.metric("vs. 20 DMA", f"{snap['Price'] / snap['20 DMA'] - 1:+.2%}" if snap["20 DMA"] else "—")
-        c3.metric("vs. 50 DMA", f"{snap['Price'] / snap['50 DMA'] - 1:+.2%}" if snap["50 DMA"] else "—")
-        c4.metric("vs. 200 DMA", f"{snap['Price'] / snap['200 DMA'] - 1:+.2%}" if snap["200 DMA"] else "—")
-        c5.metric("vs. 1Y AVWAP", f"{snap['Price'] / snap['1Y AVWAP'] - 1:+.2%}" if snap["1Y AVWAP"] else "—")
+with tab2:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        lookback = st.selectbox("Lookback", ["1Y", "3Y", "5Y"], index=2)
+    with c2:
+        stress_pct = st.selectbox("Stress sample", [10, 20, 25], index=1, format_func=lambda x: f"Worst {x}% of SPY days")
+    with c3:
+        selected = st.multiselect("Holdings", options=list(PORTFOLIO.keys()), default=list(PORTFOLIO.keys()))
 
-        st.plotly_chart(build_chart(df, selected_ticker), use_container_width=True)
-else:
-    ordered = [t for t in selected if t in display_data]
-    for start_idx in range(0, len(ordered), columns_per_row):
-        cols = st.columns(columns_per_row)
-        for col, ticker in zip(cols, ordered[start_idx:start_idx + columns_per_row]):
-            with col:
-                st.plotly_chart(
-                    build_chart(display_data[ticker], ticker, show_volume=False),
-                    use_container_width=True,
-                    key=f"chart-{ticker}",
-                )
+    if selected:
+        years = {"1Y": 1, "3Y": 3, "5Y": 5}[lookback]
+        start = today - dt.timedelta(days=int(365.25 * years) + 30)
+        tickers = tuple(dict.fromkeys(selected + ["SPY", "QQQ"]))
+        with st.spinner("Loading risk-history data..."):
+            raw = download_history(tickers, start, end_date)
+        prices = adjusted_close(raw)
+        available = [c for c in selected if c in prices.columns]
+        missing = [c for c in selected if c not in prices.columns]
+        if missing:
+            st.warning("No usable data returned for: " + ", ".join(missing))
+        if not available:
+            st.error("No usable holdings data returned.")
+        else:
+            returns = prices.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+            corr = returns[available].corr(min_periods=30)
+            vols = annualized_vol(returns[available])
+            beta_spy = beta_to(returns[available + ["SPY"]].dropna(how="all"), "SPY").reindex(available)
+            beta_qqq = beta_to(returns[available + ["QQQ"]].dropna(how="all"), "QQQ").reindex(available)
+            weights = pd.Series(PORTFOLIO).reindex(available).dropna()
+            pvol, rc, cov_ann, common_obs = portfolio_stats(returns, weights)
+            top1, top2, top3, top4 = st.columns(4)
+            top1.metric("Portfolio annualized vol", f"{pvol:.1%}" if pd.notna(pvol) else "—")
+            top2.metric("Common observations", f"{common_obs:,}")
+            top3.metric("Selected target weight", f"{weights.sum():.0%}")
+            top4.metric("Lookback", lookback)
 
-st.caption(
-    "Market data source: Yahoo Finance through yfinance. Prices may be delayed and are intended "
-    "for analytical use, not order execution."
-)
+            summary = pd.DataFrame(index=available)
+            summary["Target weight"] = pd.Series(PORTFOLIO).reindex(available)
+            summary["Annualized vol"] = vols.reindex(available)
+            summary["Beta vs SPY"] = beta_spy
+            summary["Beta vs QQQ"] = beta_qqq
+            summary["Risk contribution"] = rc.reindex(available)
+            summary["Available obs"] = [int(returns[c].notna().sum()) for c in available]
+            st.markdown("### Risk snapshot")
+            st.dataframe(summary.style.format({
+                "Target weight": "{:.0%}", "Annualized vol": "{:.1%}", "Beta vs SPY": "{:.2f}",
+                "Beta vs QQQ": "{:.2f}", "Risk contribution": "{:.1%}", "Available obs": "{:,.0f}",
+            }, na_rep="—"), use_container_width=True)
+
+            st.markdown("### Correlation matrix")
+            st.plotly_chart(heatmap(corr, f"{lookback} pairwise daily-return correlation"), use_container_width=True)
+
+            if not rc.empty:
+                rc_df = rc.sort_values().rename("Risk contribution").reset_index()
+                rc_df.columns = ["Ticker", "Risk contribution"]
+                fig_rc = px.bar(rc_df, x="Risk contribution", y="Ticker", orientation="h", text="Risk contribution", title="Contribution to portfolio variance")
+                fig_rc.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+                fig_rc.update_xaxes(tickformat=".0%")
+                fig_rc.update_layout(template="plotly_dark", height=450)
+                st.plotly_chart(fig_rc, use_container_width=True)
+
+            if "SPY" in returns.columns:
+                stress_input_cols = available + ["SPY"]
+                stress_matrix, stress_obs, threshold = stress_corr(returns[stress_input_cols], benchmark="SPY", q=stress_pct / 100.0)
+                st.markdown(f"### Stress correlation · worst {stress_pct}% of SPY days")
+                st.plotly_chart(heatmap(stress_matrix.loc[available, available], f"Stress correlation on SPY days ≤ {threshold:.2%} ({stress_obs} sessions)"), use_container_width=True)
+
+            with st.expander("Annualized covariance matrix"):
+                if cov_ann.empty:
+                    st.info("Not enough overlapping observations.")
+                else:
+                    st.dataframe(cov_ann.style.format("{:.4f}"), use_container_width=True)
+
+            st.caption(
+                "Methodology: daily adjusted-close percentage returns; annualized volatility uses √252; "
+                "portfolio volatility uses wᵀΣw; risk contribution uses each holding's component contribution to total portfolio variance. "
+                "STRK and STRF have shorter histories, which shortens common-history calculations."
+            )
