@@ -229,7 +229,7 @@ def render_debt_tab() -> None:
     today = dt.date.today()
     model_start = dt.date(today.year, today.month, 1)
     st.markdown("## Debt & Liability Tracker")
-    st.caption("Tracks consumer debt, education borrowing, accrued interest, balloon obligations and projected post-graduation amortization.")
+    st.caption("Tracks consumer debt and private education borrowing, including accrued interest, balloon obligations and projected post-graduation amortization.")
 
     st.markdown("### Consumer debt")
     c1, c2, c3, c4 = st.columns(4)
@@ -243,14 +243,15 @@ def render_debt_tab() -> None:
     with c4:
         consumer_balloon = st.date_input("Balloon date", value=dt.date(2027, 6, 1), key="debt_consumer_balloon")
 
-    st.markdown("### Education loans")
+    st.markdown("### Private education loans")
+    st.caption("Both large education-loan tranches are modeled as private loans. There is no federal-loan component.")
     e1, e2, e3, e4 = st.columns(4)
     with e1:
-        first_principal = st.number_input("August 2026 draw ($)", min_value=0.0, value=100000.0, step=5000.0, format="%.0f", key="debt_loan1_principal")
+        first_principal = st.number_input("Private loan: August 2026 draw ($)", min_value=0.0, value=100000.0, step=5000.0, format="%.0f", key="debt_loan1_principal")
     with e2:
-        second_principal = st.number_input("August 2027 draw ($)", min_value=0.0, value=100000.0, step=5000.0, format="%.0f", key="debt_loan2_principal")
+        second_principal = st.number_input("Private loan: August 2027 draw ($)", min_value=0.0, value=100000.0, step=5000.0, format="%.0f", key="debt_loan2_principal")
     with e3:
-        loan_rate = st.number_input("Education loan APR", min_value=0.0, max_value=0.30, value=0.0729, step=0.001, format="%.4f", key="debt_loan_rate")
+        loan_rate = st.number_input("Private loan APR", min_value=0.0, max_value=0.30, value=0.0729, step=0.001, format="%.4f", key="debt_loan_rate")
     with e4:
         interim_payment = st.number_input("Monthly payment before Jun 2028 ($)", min_value=0.0, value=25.0, step=5.0, format="%.0f", key="debt_interim_payment")
 
@@ -264,20 +265,12 @@ def render_debt_tab() -> None:
     with e8:
         repayment_years = st.number_input("Repayment term (years)", min_value=1, max_value=30, value=10, step=1, key="debt_repay_years")
 
-    split1, split2 = st.columns(2)
-    with split1:
-        federal_share = st.number_input("Federal share of each draw", min_value=0.0, max_value=1.0, value=0.50, step=0.05, format="%.2f", key="debt_federal_share")
-        st.caption("Editable placeholder until you enter the actual federal/private split.")
-    with split2:
-        private_share = 1.0 - float(federal_share)
-        st.metric("Private share of each draw", f"{private_share:.0%}")
-
     projection_years = st.number_input("Debt projection horizon (years)", min_value=2, max_value=30, value=15, step=1, key="debt_projection_years")
     projection_end = _add_months(model_start, int(projection_years) * 12)
 
     consumer = _consumer_schedule(float(consumer_balance), float(consumer_payment_pct), float(consumer_rate), consumer_balloon, model_start)
-    loan_2026 = _education_schedule("Education loan 2026", float(first_principal), float(loan_rate), first_draw, float(interim_payment), repayment_start, int(repayment_years), projection_end, model_start)
-    loan_2027 = _education_schedule("Education loan 2027", float(second_principal), float(loan_rate), second_draw, float(interim_payment), repayment_start, int(repayment_years), projection_end, model_start)
+    loan_2026 = _education_schedule("Private education loan 2026", float(first_principal), float(loan_rate), first_draw, float(interim_payment), repayment_start, int(repayment_years), projection_end, model_start)
+    loan_2027 = _education_schedule("Private education loan 2027", float(second_principal), float(loan_rate), second_draw, float(interim_payment), repayment_start, int(repayment_years), projection_end, model_start)
     schedule = pd.concat([consumer, loan_2026, loan_2027], ignore_index=True, sort=False)
 
     current_by_debt = {}
@@ -298,7 +291,7 @@ def render_debt_tab() -> None:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Modeled liabilities now", f"${current_total:,.0f}")
     m2.metric("Consumer debt", f"${current_by_debt.get('Consumer debt', 0.0):,.0f}")
-    m3.metric("Education debt now", f"${current_by_debt.get('Education loan 2026', 0.0) + current_by_debt.get('Education loan 2027', 0.0):,.0f}")
+    m3.metric("Private education debt now", f"${current_by_debt.get('Private education loan 2026', 0.0) + current_by_debt.get('Private education loan 2027', 0.0):,.0f}")
     m4.metric("Projected monthly payment from Jun 2028", f"${pmt_2026 + pmt_2027:,.0f}")
 
     st.markdown("### Liability balances over time")
@@ -310,10 +303,20 @@ def render_debt_tab() -> None:
     fig.update_layout(template="plotly_dark", height=520)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Education debt composition")
-    total_draws = float(first_principal) + float(second_principal)
-    split_df = pd.DataFrame({"Type": ["Federal", "Private"], "Principal": [total_draws * float(federal_share), total_draws * private_share]})
-    st.dataframe(split_df.style.format({"Principal": "${:,.0f}"}), use_container_width=True, hide_index=True)
+    st.markdown("### Private education debt composition")
+    composition = pd.DataFrame({
+        "Loan": ["Private education loan 2026", "Private education loan 2027"],
+        "Principal": [float(first_principal), float(second_principal)],
+        "Share of education borrowing": [
+            float(first_principal) / max(float(first_principal) + float(second_principal), 1.0),
+            float(second_principal) / max(float(first_principal) + float(second_principal), 1.0),
+        ],
+    })
+    st.dataframe(
+        composition.style.format({"Principal": "${:,.0f}", "Share of education borrowing": "{:.0%}"}),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     with st.expander("Monthly debt schedule"):
         st.dataframe(schedule.style.format({
@@ -321,4 +324,4 @@ def render_debt_tab() -> None:
             "Balloon": "${:,.0f}", "Ending balance": "${:,.0f}", "Scheduled full payment": "${:,.0f}",
         }), use_container_width=True, hide_index=True)
 
-    st.info("Education-loan projections are planning estimates. Actual federal/private capitalization, grace periods, fees and repayment rules can differ from this simplified model.")
+    st.info("Private education-loan projections are planning estimates. Actual capitalization timing, fees, deferment terms and repayment rules can differ from this simplified model.")
